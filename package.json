@@ -1,0 +1,21 @@
+{
+  "name": "epure-app",
+  "version": "1.0.0",
+  "description": "Épure.app — L'outil d'anti-gestion de projet. Simplicité forcée, charge mentale minimale.",
+  "main": "server/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "seed": "node server/seed.js --reset"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "express": "^4.21.2",
+    "ws": "^8.18.0"
+  },
+  "license": "MIT"
+}
