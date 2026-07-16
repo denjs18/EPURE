@@ -10,8 +10,7 @@ const toastRoot = document.getElementById('toast-root');
 
 let state = null;
 let bootstrap = null;
-let ws = null;
-let wsRetry = 1000;
+let lastPulseId = null;
 
 // Brouillon du formulaire TAF (préservé entre deux rendus temps réel).
 const draft = { title: '', objective_id: '', pilot_id: '', deliverable: '', due_date: '' };
@@ -93,58 +92,59 @@ function toggleTheme() {
 applyTheme();
 
 // ---------------------------------------------------------------------------
-// Temps réel
+// Temps réel par polling
 // ---------------------------------------------------------------------------
-function connectWs() {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
-  ws.onopen = () => {
-    wsRetry = 1000;
-    if (state) ws.send(JSON.stringify({ type: 'subscribe', team_id: state.team.id }));
-  };
-  ws.onmessage = async (event) => {
-    let msg = {};
-    try { msg = JSON.parse(event.data); } catch { return; }
-    if (msg.type !== 'sync') return;
-    const before = state?.lastPulse?.id;
-    await loadState();
-    if (msg.event === 'pulse' && state?.lastPulse && state.lastPulse.id !== before) {
-      toast(state.lastPulse.message);
-    }
-    if (msg.event === 'freeze') {
-      toast("Fin du cycle — Évaluation Éclair : l'interface est gelée.");
-    }
-  };
-  ws.onclose = () => {
-    setTimeout(connectWs, wsRetry);
-    wsRetry = Math.min(wsRetry * 2, 15000);
-  };
+// Recharge l'état périodiquement, en évitant de perturber une saisie en cours
+// (formulaire TAF, modale, saisie de la rétrospective).
+const POLL_MS = 4000;
+
+function pollBlocked() {
+  if (!state || !currentUserId() || document.hidden) return true;
+  if (modalRoot.innerHTML) return true;
+  if (document.querySelector('.retro-overlay[data-mode="form"]')) return true;
+  const ae = document.activeElement;
+  if (ae && ['INPUT', 'SELECT', 'TEXTAREA'].includes(ae.tagName)) return true;
+  return false;
 }
 
-function subscribeWs() {
-  if (ws && ws.readyState === 1 && state) {
-    ws.send(JSON.stringify({ type: 'subscribe', team_id: state.team.id }));
-  }
+function pollTick() {
+  if (pollBlocked()) return;
+  loadState({ poll: true });
 }
+
+setInterval(pollTick, POLL_MS);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) pollTick();
+});
 
 // ---------------------------------------------------------------------------
 // Chargement
 // ---------------------------------------------------------------------------
-async function loadState() {
+async function loadState({ poll = false } = {}) {
   if (!currentUserId()) {
     state = null;
+    lastPulseId = null;
     await renderEntry();
     return;
   }
   try {
-    state = await api('/api/state');
+    const next = await api('/api/state');
+    // Détection d'un nouveau Pulse (annonce discrète), y compris déclenché
+    // par un coéquipier ou par le Cron.
+    if (next.lastPulse) {
+      if (lastPulseId !== null && next.lastPulse.id !== lastPulseId) {
+        toast(next.lastPulse.message);
+      }
+      lastPulseId = next.lastPulse.id;
+    }
+    state = next;
     render();
-    subscribeWs();
   } catch (err) {
     if (err.status === 401) {
       localStorage.removeItem('epure_user');
+      lastPulseId = null;
       await renderEntry();
-    } else {
+    } else if (!poll) {
       toast(err.message);
     }
   }
@@ -390,7 +390,7 @@ function renderPulse(isLeader) {
     ? `<div class="pulse-result ${p.scenario}">
          ${esc(p.message)}
          ${p.meet_link ? `<br /><a href="${esc(p.meet_link)}" target="_blank" rel="noopener">Rejoindre la réunion Pulse (10 min max)</a>` : ''}
-         <span class="when">${new Date(p.created_at.replace(' ', 'T') + 'Z').toLocaleString('fr-FR', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}</span>
+         <span class="when">${new Date(p.created_at).toLocaleString('fr-FR', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}</span>
        </div>`
     : `<div class="empty">Aucun Pulse pour l'instant. La routine se déclenche chaque matin à ${esc(state.team.pulse_time)}.</div>`;
 
@@ -536,6 +536,7 @@ function bindDashboard(isLeader, isDirection) {
   document.getElementById('theme-toggle')?.addEventListener('click', toggleTheme);
   document.getElementById('switch-user')?.addEventListener('click', () => {
     localStorage.removeItem('epure_user');
+    lastPulseId = null;
     loadState();
   });
 
@@ -591,6 +592,7 @@ function bindDashboard(isLeader, isDirection) {
   document.getElementById('pulse-now')?.addEventListener('click', () =>
     guard(async () => {
       const result = await api('/api/pulse/run', { method: 'POST', body: {} });
+      lastPulseId = result.id; // évite un double toast au prochain poll
       toast(result.message);
     })
   );
@@ -630,6 +632,7 @@ function bindDashboard(isLeader, isDirection) {
 async function guard(fn) {
   try {
     await fn();
+    await loadState(); // recharge l'état après mutation (plus de WebSocket)
   } catch (err) {
     if (err.code === 'slot_full') return; // géré par la modale Swap
     toast(err.message);
@@ -832,6 +835,7 @@ async function activateObjective(objectiveId, macroId, swap) {
       body: { macro_id: macroId, ...(swap || {}) },
     });
     closeModal();
+    await loadState(); // rafraîchit immédiatement (plus de WebSocket)
   } catch (err) {
     if (err.code === 'slot_full') {
       openSwapModal(objectiveId, macroId);
@@ -914,6 +918,7 @@ function renderRetroOverlay() {
     retroInterval = null;
     const overlay = existing || document.createElement('div');
     overlay.className = 'retro-overlay';
+    delete overlay.dataset.mode; // repasse en mode « attente » : le polling reprend
     overlay.innerHTML = `
       <span class="wordmark" style="font-size:26px; margin-bottom:36px">épure<span class="dot">.</span></span>
       <h2>Merci. Votre réponse est enregistrée.</h2>
@@ -984,11 +989,4 @@ function renderRetroOverlay() {
 // ---------------------------------------------------------------------------
 // Démarrage
 // ---------------------------------------------------------------------------
-connectWs();
 loadState();
-
-// Filet de sécurité : rafraîchit le compte à rebours et détecte le gel
-// même si un événement temps réel se perd.
-setInterval(() => {
-  if (state && currentUserId()) loadState();
-}, 60_000);
